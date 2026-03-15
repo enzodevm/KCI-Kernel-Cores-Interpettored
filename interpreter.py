@@ -4,9 +4,6 @@ import shutil
 import shlex
 import subprocess
 
-# ==============================
-# CONFIG
-# ==============================
 GCC = "gcc"
 LD = "ld"
 QEMU = "qemu-system-i386"
@@ -16,12 +13,10 @@ generated_functions = ""
 generated_main = ""
 inside_function = False
 
-# track declared variables and their types
 variables = {}
 
-# ==============================
-# TEMPLATE DO KERNEL
-# ==============================
+block_stack = []
+
 KERNEL_TEMPLATE_START = r"""
 #include <stdint.h>
 #include <string.h>
@@ -75,7 +70,6 @@ void kprint_int(int value) {
 
     buf[i] = 0;
 
-    // reverse
     for (int j = 0; j < i / 2; j++) {
         char t = buf[j];
         buf[j] = buf[i - 1 - j];
@@ -85,6 +79,14 @@ void kprint_int(int value) {
     kprint(buf);
 }
 
+int strcmp(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return (unsigned char)*s1 - (unsigned char)*s2;
+}
+
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
@@ -92,7 +94,6 @@ static inline uint8_t inb(uint16_t port) {
 }
 
 static inline uint8_t kb_read() {
-    // wait until keyboard output buffer is full
     while (!(inb(0x64) & 1)) {}
     return inb(0x60);
 }
@@ -109,8 +110,6 @@ char scancode_to_ascii(uint8_t sc) {
         case 0x09: return '8';
         case 0x0A: return '9';
         case 0x0B: return '0';
-        case 0x0C: return '-';
-        case 0x0D: return '=';
         case 0x10: return 'q';
         case 0x11: return 'w';
         case 0x12: return 'e';
@@ -139,8 +138,6 @@ char scancode_to_ascii(uint8_t sc) {
         case 0x32: return 'm';
         case 0x39: return ' ';
         case 0x1C: return '\n';
-        case 0x0E: return '\b';
-        case 0x0F: return '\t';
         default: return 0;
     }
 }
@@ -148,16 +145,9 @@ char scancode_to_ascii(uint8_t sc) {
 char getch() {
     while (1) {
         uint8_t sc = kb_read();
-
-        // ignore key release and extended scancodes
-        if (sc & 0x80 || sc == 0xE0 || sc == 0xE1) {
-            continue;
-        }
-
+        if (sc & 0x80) continue;
         char c = scancode_to_ascii(sc);
-        if (c) {
-            return c;
-        }
+        if (c) return c;
     }
 }
 
@@ -170,17 +160,8 @@ void read_line(char* buf, int max) {
             kprint("\n");
             return;
         }
-
-        if (c == '\b') {
-            if (i > 0) {
-                i--;
-                kprint("\b \b");
-            }
-            continue;
-        }
-
         buf[i++] = c;
-        char tmp[2] = {c, 0};
+        char tmp[2] = {c,0};
         kprint(tmp);
     }
     buf[i] = 0;
@@ -188,26 +169,14 @@ void read_line(char* buf, int max) {
 
 int read_int() {
     char buf[32];
-    read_line(buf, sizeof(buf));
-    int i = 0;
-    int sign = 1;
-    int value = 0;
-
-    if (buf[0] == '-') {
-        sign = -1;
-        i = 1;
-    }
-
-    while (buf[i]) {
-        if (buf[i] >= '0' && buf[i] <= '9') {
-            value = value * 10 + (buf[i] - '0');
-        } else {
-            break;
-        }
+    read_line(buf,sizeof(buf));
+    int v = 0;
+    int i=0;
+    while(buf[i]){
+        v = v*10 + (buf[i]-'0');
         i++;
     }
-
-    return value * sign;
+    return v;
 }
 
 /* ==== FUNÇÕES GERADAS ==== */
@@ -226,343 +195,166 @@ KERNEL_TEMPLATE_END = r"""
 }
 """
 
-# ==============================
-# COMANDOS .kci
-# ==============================
-
-def cmd_var(args):
-    global generated_functions, generated_main, variables
-
-    if len(args) < 2:
-        print("Uso: var <tipo> <nome> [= <valor>]")
-        return
-
-    var_type = args[0]
-    var_name = args[1]
-
-    init_value = None
-    if len(args) > 2:
-        # allow: var int x = 5  or var string s = "hi"
-        if args[2] == "=" and len(args) > 3:
-            init_value = " ".join(args[3:])
-        else:
-            init_value = " ".join(args[2:])
-
-    variables[var_name] = var_type
-
-    if var_type == "int":
-        if init_value:
-            generated_functions += f"int {var_name} = {init_value};\n"
-        else:
-            generated_functions += f"int {var_name};\n"
-    elif var_type == "char":
-        if init_value:
-            v = init_value.strip()
-            if v.startswith('"') and v.endswith('"'):
-                v = "'" + v[1:-1] + "'"
-            generated_functions += f"char {var_name} = {v};\n"
-        else:
-            generated_functions += f"char {var_name};\n"
-    elif var_type == "string":
-        generated_functions += f"char {var_name}[256];\n"
-        if init_value:
-            val = init_value
-            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                val = val[1:-1]
-            generated_main += f'    strcpy({var_name}, "{val}");\n'
+def emit(line):
+    global generated_main, generated_functions, inside_function
+    if inside_function:
+        generated_functions += line + "\n"
     else:
-        print(f"Tipo desconhecido: {var_type}. Suportado: int, char, string")
+        generated_main += line + "\n"
 
+def translate_condition(tokens):
+    # Keep C-style comparisons for numeric values, but use strcmp for string comparisons.
+    if len(tokens) == 3 and tokens[1] in ("==", "!="):
+        left, op, right = tokens
+        left_is_str = left in variables and variables[left] == "string"
+        right_is_str = right in variables and variables[right] == "string"
+        left_is_lit = len(left) >= 2 and ((left[0] == '"' and left[-1] == '"') or (left[0] == "'" and left[-1] == "'"))
+        right_is_lit = len(right) >= 2 and ((right[0] == '"' and right[-1] == '"') or (right[0] == "'" and right[-1] == "'"))
 
-def cmd_set(args):
-    global generated_main, variables
-
-    if len(args) < 2:
-        print("Uso: set <variavel> <valor>")
-        return
-
-    name = args[0]
-    if name not in variables:
-        print(f"Variável não declarada: {name}")
-        return
-
-    t = variables[name]
-    val = " ".join(args[1:])
-
-    if t == "int":
-        generated_main += f"    {name} = {val};\n"
-    elif t == "char":
-        v = val.strip()
-        if v.startswith('"') and v.endswith('"'):
-            v = "'" + v[1:-1] + "'"
-        generated_main += f"    {name} = {v};\n"
-    elif t == "string":
-        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-            val = val[1:-1]
-        generated_main += f'    strcpy({name}, "{val}");\n'
-
-
-def cmd_input(args):
-    global generated_main, variables
-
-    if len(args) != 1:
-        print("Uso: input <variavel>")
-        return
-
-    name = args[0]
-    if name not in variables:
-        print(f"Variável não declarada: {name}")
-        return
-
-    t = variables[name]
-    if t == "int":
-        generated_main += f"    {name} = read_int();\n"
-    elif t == "char":
-        generated_main += f"    {name} = getch();\n"
-    elif t == "string":
-        generated_main += f"    read_line({name}, sizeof({name}));\n"
-
-
-def cmd_imports(args, name):
-    global generated_functions
-    generated_functions += f"#include \"./libs/{name}.c\"\n"
-def cmd_print(args):
-    global generated_functions, generated_main, inside_function, variables
-
-    if not args:
-        return
-
-    # If only a single variable is printed, use the correct primitive printer
-    if len(args) == 1 and args[0] in variables:
-        var = args[0]
-        t = variables[var]
-
-        if t == "int":
-            line = f"    kprint_int({var});\n"
-        elif t == "char":
-            line = f"    kprint_char({var});\n"
-        else:
-            line = f"    kprint({var});\n"
-
-        line += "    kprint(\"\\n\");\n"
-        if inside_function:
-            generated_functions += line
-        else:
-            generated_main += line
-        return
-
-    # Mixed literals and variables: concatenate by emitting multiple prints
-    out_lines = []
-    pending_literal = ""
-
-    def flush_literal():
-        nonlocal pending_literal
-        if not pending_literal:
-            return
-
-        # substitute {var} placeholders
-        parts = re.split(r'(\{[^}]+\})', pending_literal)
-        for part in parts:
-            if not part:
-                continue
-            if part.startswith("{") and part.endswith("}"):
-                name = part[1:-1]
-                if name in variables:
-                    t = variables[name]
-                    if t == "int":
-                        out_lines.append(f"    kprint_int({name});")
-                    elif t == "char":
-                        out_lines.append(f"    kprint_char({name});")
-                    else:
-                        out_lines.append(f"    kprint({name});")
-                    continue
-            escaped = part.replace('"', '\\"')
-            out_lines.append(f'    kprint("{escaped}");')
-
-        pending_literal = ""
-
-    for tok in args:
-        if tok in variables:
-            flush_literal()
-            t = variables[tok]
-            if t == "int":
-                out_lines.append(f"    kprint_int({tok});")
-            elif t == "char":
-                out_lines.append(f"    kprint_char({tok});")
+        if (left_is_str and (right_is_lit or right_is_str)) or (right_is_str and (left_is_lit or left_is_str)):
+            # Always compare strings using strcmp (C string compare)
+            if left_is_str:
+                var = left
+                other = right
             else:
-                out_lines.append(f"    kprint({tok});")
-        else:
-            # allow quoted strings to be written normally
-            if (tok.startswith('"') and tok.endswith('"')) or (tok.startswith("'") and tok.endswith("'")):
-                tok = tok[1:-1]
+                var = right
+                other = left
+            cmp = f"strcmp({var}, {other})"
+            return f"{cmp} == 0" if op == "==" else f"{cmp} != 0"
 
-            if pending_literal:
-                pending_literal += " "
-            pending_literal += tok
-
-    flush_literal()
-    out_lines.append('    kprint("\\n");')
-
-    line = "\n".join(out_lines) + "\n"
-    if inside_function:
-        generated_functions += line
-    else:
-        generated_main += line
+    return " ".join(tokens)
 
 
-def cmd_func(args):
-    global generated_functions, inside_function
-    name = args[0]
-    generated_functions += f"\nvoid {name}() {{\n"
-    inside_function = True
+def cmd_if(args):
+    global block_stack
+    condition = translate_condition(args)
+    emit(f"    if ({condition}) {{")
+    block_stack.append("if")
 
 
-def cmd_raw(args):
-    global generated_functions, generated_main, inside_function
-    line = " ".join(args)
+def cmd_else(args):
+    emit("    } else {")
 
-    if inside_function:
-        generated_functions += f"    {line}\n"
-    else:
-        generated_main += f"    {line}\n"
 
+def cmd_while(args):
+    global block_stack
+    condition = translate_condition(args)
+    emit(f"    while ({condition}) {{")
+    block_stack.append("while")
 
 def cmd_end(args):
-    global generated_functions, inside_function
-    generated_functions += "}\n"
-    inside_function = False
+    global block_stack
+    if not block_stack:
+        return
+    block_stack.pop()
+    emit("    }")
 
-def cmd_delay(args):
-    global generated_code
-    seconds = int(args[0])
-    loops = seconds * 100_000_000
-    generated_code += f"""
-    for (volatile int i = 0; i < {loops}; i++) {{
-        __asm__("nop");
-    }}
-"""
+def cmd_var(args):
+    global generated_functions, variables
+    t = args[0]
+    n = args[1]
+    variables[n] = t
+    if t == "int":
+        generated_functions += f"int {n};\n"
+    if t == "string":
+        generated_functions += f"char {n}[256];\n"
 
+def cmd_input(args):
+    n = args[0]
+    t = variables[n]
+    if t == "int":
+        emit(f"    {n} = read_int();")
+    else:
+        emit(f"    read_line({n}, sizeof({n}));")
 
+def cmd_set(args):
+    emit(f"    {args[0]} = {' '.join(args[1:])};")
+
+def cmd_print(args):
+    for a in args:
+        if a in variables:
+            if variables[a] == "int":
+                emit(f"    kprint_int({a});")
+            else:
+                emit(f"    kprint({a});")
+        else:
+            txt=a.strip('"')
+            emit(f'    kprint("{txt}");')
+    emit('    kprint("\\n");')
 
 COMMANDS = {
-    "print": cmd_print,
-    "var": cmd_var,
-    "set": cmd_set,
-    "input": cmd_input,
-    "func": cmd_func,
-    "raw": cmd_raw,
-    "end": cmd_end,
-    "delay": cmd_delay,
-    "inject": cmd_imports,
+    "print":cmd_print,
+    "var":cmd_var,
+    "input":cmd_input,
+    "set":cmd_set,
+    "if":cmd_if,
+    "else":cmd_else,
+    "while":cmd_while,
+    "end":cmd_end
 }
 
-# ==============================
-# INTERPRETADOR
-# ==============================
+def split_tokens(line):
+    # Split by whitespace, but keep quoted strings as single tokens.
+    return re.findall(r'"[^"]*"|\'[^\']*\'|\S+', line)
+
+
 def interpretar():
     for file in os.listdir("."):
         if file.endswith(".kci"):
             with open(file) as f:
                 for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-
-                    parts = shlex.split(line)
-                    if not parts:
-                        continue
-
-                    cmd = parts[0]
-
+                    line=line.strip()
+                    if not line: continue
+                    parts=split_tokens(line)
+                    cmd=parts[0]
                     if cmd in COMMANDS:
                         COMMANDS[cmd](parts[1:])
-                    else:
-                        print(f"Comando desconhecido: {cmd}")
 
-# ==============================
-# BUILD
-# ==============================
 def build():
-    # 1. Gerar kernel.c
     print("Gerando kernel.c...")
-    with open("kernel.c", "w") as f:
+    with open("kernel.c","w") as f:
         f.write(KERNEL_TEMPLATE_START)
         f.write(generated_functions)
         f.write(KERNEL_TEMPLATE_MIDDLE)
         f.write(generated_main)
         f.write(KERNEL_TEMPLATE_END)
 
-    # 2. Compilar
-    print("Compilando kernel.o...")
-    subprocess.run([
-        GCC, "-m32", "-ffreestanding",
-        "-nostdlib", "-fno-pic",
-        "-O0",
-        "-c", "kernel.c", "-o", "kernel.o"
-    ], check=True)
+    subprocess.run([GCC,"-m32","-ffreestanding","-nostdlib","-fno-pic","-c","kernel.c","-o","kernel.o"],check=True)
 
-    # 3. Linker
-    print("Criando linker.ld...")
-    with open("linker.ld", "w") as f:
+    with open("linker.ld","w") as f:
         f.write("""ENTRY(_start)
+SECTIONS{
+. = 1M;
+.text : { *(.multiboot*) *(.text*) }
+.rodata : { *(.rodata*) }
+.data : { *(.data*) }
+.bss : { *(COMMON) *(.bss*) }
+}""")
 
-SECTIONS
-{
-    . = 1M;
+    subprocess.run([LD,"-m","elf_i386","-T","linker.ld","kernel.o","-o","kernel.elf"],check=True)
 
-    .text : { *(.multiboot*) *(.text*) }
-    .rodata : { *(.rodata*) }
-    .data : { *(.data*) }
-    .bss : { *(COMMON) *(.bss*) }
-}
-""")
-
-    print("Linkando kernel.elf...")
-    subprocess.run([
-        LD, "-m", "elf_i386",
-"-T", "linker.ld",
-"-nostdlib",
-"kernel.o",
-"-o", "kernel.elf"
-    ], check=True)
-
-    # 4. Estrutura ISO
     if os.path.exists(ISO_DIR):
         shutil.rmtree(ISO_DIR)
 
-    os.makedirs(os.path.join(ISO_DIR, "boot", "grub"), exist_ok=True)
-    shutil.copy("kernel.elf", os.path.join(ISO_DIR, "boot", "kernel.elf"))
+    os.makedirs("iso/boot/grub",exist_ok=True)
+    shutil.copy("kernel.elf","iso/boot/kernel.elf")
 
-    # 5. grub.cfg
-    print("Criando grub.cfg...")
-    with open(os.path.join(ISO_DIR, "boot", "grub", "grub.cfg"), "w") as f:
+    with open("iso/boot/grub/grub.cfg","w") as f:
         f.write("""
 set timeout=0
 set default=0
 
 menuentry "MeuKernel" {
-    multiboot /boot/kernel.elf
-    boot
+multiboot /boot/kernel.elf
+boot
 }
 """)
 
-    # 6. ISO
-    print("Gerando ISO...")
-    subprocess.run([
-        "grub-mkrescue",
-        "-o", "kernel.iso",
-        ISO_DIR,
-        
-    ], check=True)
+    subprocess.run(["grub-mkrescue","-o","kernel.iso","iso"],check=True)
 
-    print("Build finalizado!")
+    if input("Rodar? s/n: ")=="s":
+        subprocess.run([QEMU,"-cdrom","kernel.iso"])
 
-    if input("Rodar no QEMU? (s/n): ").lower() == "s":
-        subprocess.run([QEMU, "-cdrom", "kernel.iso"])
-
-# ==============================
-# MAIN
-# ==============================
-if __name__ == "__main__":
+if __name__=="__main__":
     interpretar()
     build()
