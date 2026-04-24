@@ -18,8 +18,8 @@ variables = {}
 block_stack = []
 
 KERNEL_TEMPLATE_START = r"""
+
 #include <stdint.h>
-#include <string.h>
 
 __attribute__((section(".multiboot"), used))
 const uint32_t multiboot_header[] = {
@@ -29,13 +29,51 @@ const uint32_t multiboot_header[] = {
 };
 
 typedef unsigned short u16;
+typedef uint32_t size_t;
 u16* video = (u16*)0xB8000;
 int cursor = 0;
+
+void* memset(void* s, int c, uint32_t n) {
+    unsigned char* p = s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
+void* memcpy(void* dest, const void* src, uint32_t n) {
+    unsigned char* d = dest;
+    const unsigned char* s = src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+size_t strlen(const char* s) {
+    size_t len = 0;
+    while (s[len]) len++;
+    return len;
+}
+
+void clear_screen() {
+    for (int i = 0; i < 80 * 25; i++) {
+        video[i] = (0x0F << 8) | ' ';
+    }
+    cursor = 0;
+}
 
 void kprint(const char* str) {
     int i = 0;
     while (str[i]) {
-        video[cursor++] = (0x0F << 8) | str[i++];
+        if (str[i] == '\n') {
+            cursor = (cursor / 80 + 1) * 80; // próxima linha
+        } else {
+            video[cursor++] = (0x0F << 8) | str[i];
+        }
+        i++;
+    }
+
+    if (cursor == 80 * 25) {
+    cursor = 0;
+    clear_screen();
+
     }
 }
 
@@ -87,6 +125,10 @@ int strcmp(const char *s1, const char *s2) {
     return (unsigned char)*s1 - (unsigned char)*s2;
 }
 
+static inline void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
@@ -136,17 +178,89 @@ char scancode_to_ascii(uint8_t sc) {
         case 0x30: return 'b';
         case 0x31: return 'n';
         case 0x32: return 'm';
+        case 0x0E: return '\b';
         case 0x39: return ' ';
-        case 0x1C: return '\n';
         default: return 0;
     }
+}
+
+#define ATA_PRIMARY_IO 0x1F0
+#define ATA_PRIMARY_CTRL 0x3F6
+
+int ata_wait_bsy() {
+    uint32_t timeout = 1000000;
+    while ((inb(ATA_PRIMARY_IO + 7) & 0x80) && --timeout);
+    if (timeout == 0) return -1;
+    return 0;
+}
+
+int ata_wait_drq() {
+    uint32_t timeout = 1000000;
+    while (!(inb(ATA_PRIMARY_IO + 7) & 0x08) && --timeout);
+    if (timeout == 0) return -1;
+    return 0;
+}
+
+void write_sector(uint32_t lba, uint16_t* buffer) {
+    // 1. Select Drive and send bits 24-27 of LBA
+    outb(ATA_PRIMARY_IO + 6, 0xE0 | ((lba >> 24) & 0x0F));
+    
+    // 2. Send Null byte (for compatibility) and Sector Count (1)
+    outb(ATA_PRIMARY_IO + 1, 0x00);
+    outb(ATA_PRIMARY_IO + 2, 1);
+    
+    // 3. Send LBA bits 0-7, 8-15, 16-23
+    outb(ATA_PRIMARY_IO + 3, (uint8_t)lba);
+    outb(ATA_PRIMARY_IO + 4, (uint8_t)(lba >> 8));
+    outb(ATA_PRIMARY_IO + 5, (uint8_t)(lba >> 16));
+    
+    // 4. Send Command 0x30 (Write Sectors)
+    outb(ATA_PRIMARY_IO + 7, 0x30);
+
+    // 5. Wait for the drive to be ready to receive data
+    if (ata_wait_bsy() < 0 || ata_wait_drq() < 0) {
+        kprint("Error: ATA Write Timeout\n");
+        return;
+    }
+
+    // 6. Transfer the data
+    for (int i = 0; i < 256; i++) {
+        __asm__ volatile ("outw %w0, %w1" : : "a"(buffer[i]), "d"((uint16_t)ATA_PRIMARY_IO));
+    }
+}
+
+void read_sector(uint32_t lba, uint16_t* buffer) {
+    outb(ATA_PRIMARY_IO + 6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_PRIMARY_IO + 1, 0x00);
+    outb(ATA_PRIMARY_IO + 2, 1);
+    outb(ATA_PRIMARY_IO + 3, (uint8_t)lba);
+    outb(ATA_PRIMARY_IO + 4, (uint8_t)(lba >> 8));
+    outb(ATA_PRIMARY_IO + 5, (uint8_t)(lba >> 16));
+    outb(ATA_PRIMARY_IO + 7, 0x20);
+
+    if (ata_wait_bsy() < 0 || ata_wait_drq() < 0) {
+        kprint("Error: ATA Read Timeout\n");
+        return;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        uint16_t data;
+        __asm__ volatile ("inw %w1, %w0" : "=a"(data) : "d"((uint16_t)ATA_PRIMARY_IO));
+        buffer[i] = data;
+    }
+}
+
+char scancode_to_ascii_fixed(uint8_t sc) {
+    if (sc == 0x1C) return '\n';
+    char c = scancode_to_ascii(sc);
+    return c;
 }
 
 char getch() {
     while (1) {
         uint8_t sc = kb_read();
         if (sc & 0x80) continue;
-        char c = scancode_to_ascii(sc);
+        char c = scancode_to_ascii_fixed(sc);
         if (c) return c;
     }
 }
@@ -280,7 +394,8 @@ def cmd_print(args):
         else:
             txt=a.strip('"')
             emit(f'    kprint("{txt}");')
-    emit('    kprint("\\n");')
+
+
 
 COMMANDS = {
     "print":cmd_print,
@@ -319,7 +434,18 @@ def build():
         f.write(generated_main)
         f.write(KERNEL_TEMPLATE_END)
 
-    subprocess.run([GCC,"-m32","-ffreestanding","-nostdlib","-fno-pic","-c","kernel.c","-o","kernel.o"],check=True)
+    subprocess.run([
+    GCC,
+    "-m32",
+    "-ffreestanding",
+    "-nostdlib",
+    "-fno-pic",
+    "-fno-stack-protector",
+    "-c",
+    "kernel.c",
+    "-o",
+    "kernel.o"
+], check=True)
 
     with open("linker.ld","w") as f:
         f.write("""ENTRY(_start)
@@ -353,7 +479,10 @@ boot
     subprocess.run(["grub-mkrescue","-o","kernel.iso","iso"],check=True)
 
     if input("Rodar? s/n: ")=="s":
-        subprocess.run([QEMU,"-cdrom","kernel.iso"])
+        # Create a 10MB disk image if it doesn't exist
+        if not os.path.exists("disk.img"):
+            subprocess.run(["qemu-img", "create", "-f", "raw", "disk.img", "10M"])
+        subprocess.run([QEMU, "-cdrom", "kernel.iso", "-hda", "disk.img", "-boot", "d"])
 
 if __name__=="__main__":
     interpretar()

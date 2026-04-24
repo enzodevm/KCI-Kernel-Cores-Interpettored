@@ -1,0 +1,6 @@
+print "ENZOS>"
+var string sh
+input sh 
+if sh == "info"
+print "Directly, Security, Fastly, ENZOS 1.0\nPROC:QEMU X86\n"
+end
